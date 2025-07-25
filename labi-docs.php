@@ -36,22 +36,69 @@ function labi_append_cena_ar_pvn_checkout_qty($quantity_html, $cart_item, $cart_
 }
 
 add_action('init', function () {
-    register_post_type('document', [
-        'label' => 'Documents',
-        'public' => true,
-        'supports' => ['title', 'editor'],
-        'show_in_menu' => true,
-        'menu_icon' => 'dashicons-media-document',
-        'has_archive' => true,
-        'rewrite' => ['slug' => 'document'],
-        'show_in_rest' => true,
-    ]);
+    if (!is_admin()) return;
+
+    $upload_dir = wp_upload_dir();
+    $doc_folder = $upload_dir['basedir'] . '/documents';
+    if (!is_dir($doc_folder)) return;
+
+    foreach (glob($doc_folder . '/*.{pdf,doc,docx}', GLOB_BRACE) as $file) {
+        // Skip if modified very recently (likely just uploaded)
+        if (time() - filemtime($file) < 30) continue;
+
+        // Build file URL
+        $url = $upload_dir['baseurl'] . '/documents/' . basename($file);
+
+        // Check if any post already uses this file URL (product or document)
+        $existing = get_posts([
+            'post_type'   => ['document', 'product'],
+            'post_status' => 'any',
+            'meta_key'    => 'document_file_url',
+            'meta_value'  => $url,
+            'numberposts' => 1,
+        ]);
+
+        if (!empty($existing)) {
+            continue; // Already imported
+        }
+
+        // Create post
+        $title = pathinfo($file, PATHINFO_FILENAME);
+        $post_id = wp_insert_post([
+            'post_type'   => 'document',
+            'post_status' => 'publish',
+            'post_title'  => $title,
+            'post_author' => get_current_user_id(),
+        ]);
+
+        if (is_wp_error($post_id)) {
+            error_log("❌ Failed to create post for $file: " . $post_id->get_error_message());
+            continue;
+        }
+
+        // Store file URL in post meta
+        update_post_meta($post_id, 'document_file_url', $url);
+
+        // Generate preview images
+        try {
+            labi_convert_pdf_to_images($post_id, $file);
+        } catch (Throwable $e) {
+            error_log("❌ Error generating images for $file: " . $e->getMessage());
+        }
+    }
 });
 
-add_action('woocommerce_after_shop_loop_item', 'labi_add_wishlist_button', 20);
-function labi_add_wishlist_button() {
+add_action('woocommerce_before_shop_loop_item', function () {
+    echo '<div class="labi-product-image-wrapper" style="position:relative;">';
+}, 5);
+
+add_action('woocommerce_before_shop_loop_item_title', function () {
     echo do_shortcode('[yith_wcwl_add_to_wishlist]');
-}
+}, 9);
+
+add_action('woocommerce_before_shop_loop_item_title', function () {
+    echo '</div>'; // Close .labi-product-image-wrapper
+}, 11);
 
 add_filter('upload_mimes', function ($mimes) {
     $mimes['pdf']  = 'application/pdf';
@@ -81,14 +128,14 @@ function labi_convert_pdf_to_images($post_id, $pdf_path) {
     $blur_mode = get_post_meta($post_id, '_blur_mode', true) ?: 'other';
 
     $allowed_pages = match ($blur_mode) {
-        'instrukcijas' => [0 => 'full', 1 => 'full', 2 => 'partial_blur'],
-        'riski'        => [0 => 'full', 1 => 'partial_blur'],
-        'other'        => [0 => 'partial_blur'],
-        default        => [0 => 'partial_blur'],
+        'instrukcijas' => ['full', 'full', 'partial_blur'],
+        'riski'        => ['full', 'partial_blur'],
+        'other'        => ['partial_blur'],
+        default        => ['partial_blur'],
     };
 
     $upload_dir = wp_upload_dir();
-
+    $allowed_pages = array_values($allowed_pages);
     foreach ($allowed_pages as $i => $type) {
         try {
             $imagick = new Imagick();
@@ -171,7 +218,7 @@ function labi_handle_cf7_upload($contact_form) {
         $final_pdf_path = $new_path;
 
         if (in_array($ext, ['doc', 'docx', 'xls', 'xlsx', 'pptx'])) {
-            $soffice = '"C:\\Program Files\\LibreOffice\\program\\soffice.exe"';
+            $soffice = '/home/u228067472/libreoffice/libreoffice_all/opt/libreoffice25.2/program/soffice';
             $input_path = realpath($new_path);
             $output_dir = realpath($target_dir);
             $converted_pdf = $output_dir . '/' . pathinfo($filename, PATHINFO_FILENAME) . '.pdf';
@@ -240,16 +287,17 @@ add_shortcode('doc_preview', function () {
     $html = '<div class="doc-preview">';
     $found = false;
 
+   $hasImage = false;
     for ($i = 0; $i < 5; $i++) {
         $img_path = $upload_dir['basedir'] . "/doc_{$post_id}_page_{$i}.jpg";
-        $img_url = $upload_dir['baseurl'] . "/doc_{$post_id}_page_{$i}.jpg";
+        $img_url  = $upload_dir['baseurl'] . "/doc_{$post_id}_page_{$i}.jpg";
         if (file_exists($img_path)) {
             $html .= "<img src='$img_url' style='max-width:100%; margin-bottom:10px;' />";
-            $found = true;
+            $hasImage = true;
         }
     }
 
-    if (!$found) {
+    if (!$hasImage) {
         $file_url = get_post_meta($post_id, 'document_file_url', true);
         $html .= "<p>📄 <a href='$file_url' target='_blank'>Download document</a></p>";
     }
@@ -258,11 +306,35 @@ add_shortcode('doc_preview', function () {
 });
 
 add_filter('the_content', function ($content) {
-    if (in_array(get_post_type(), ['document', 'product'])) {
+    global $post;
+    if (!$post || $post->post_type !== 'product') {
+        return $content;
+    }
+
+    $product = wc_get_product($post->ID);
+    $upload_dir = wp_upload_dir();
+
+    // Check if product is downloadable
+    $is_downloadable = $product && $product->is_downloadable();
+
+    // Check if any preview images exist
+    $has_preview_image = false;
+    for ($i = 0; $i < 5; $i++) {
+        $img_path = $upload_dir['basedir'] . "/doc_{$post->ID}_page_{$i}.jpg";
+        if (file_exists($img_path)) {
+            $has_preview_image = true;
+            break;
+        }
+    }
+
+    if ($is_downloadable || $has_preview_image) {
         return do_shortcode('[doc_preview]') . $content;
     }
+
+    // Else: product is not downloadable and has no preview — show just content
     return $content;
 });
+
 
 add_filter('wpcf7_skip_mail', '__return_true');
 
@@ -279,7 +351,7 @@ add_action('init', function () {
 
         // Only continue if no document post already exists with this file URL
         $existing = get_posts([
-            'post_type'   => 'document',
+            'post_type'   => ['document', 'product'], // check both
             'meta_key'    => 'document_file_url',
             'meta_value'  => $url,
             'numberposts' => 1,
@@ -365,37 +437,40 @@ add_action('woocommerce_before_single_product_summary', function () {
     global $post;
     if (!$post || get_post_type($post) !== 'product') return;
 
-    $upload_dir = wp_upload_dir();
+    $product = wc_get_product($post->ID);
     $post_id = $post->ID;
+    $upload_dir = wp_upload_dir();
 
     echo '<div class="labi-product-wrapper" style="display:flex; flex-wrap:wrap; gap:40px; margin-bottom:40px;">';
 
-    // LEFT SIDE: Document previews
+    // LEFT SIDE
     echo '<div class="labi-doc-preview-gallery" style="flex:1; min-width:300px; display:flex; flex-direction:row; flex-wrap:wrap; gap:10px;">';
 
-    $found = false;
-    for ($i = 0; $i < 10; $i++) {
-        $img_path = $upload_dir['basedir'] . "/doc_{$post_id}_page_{$i}.jpg";
-        $img_url = $upload_dir['baseurl'] . "/doc_{$post_id}_page_{$i}.jpg";
-        if (file_exists($img_path)) {
-            echo "<a href='$img_url' class='doc-lightbox' data-gallery='product-{$post_id}' data-glightbox='title: Preview page ".($i)."'>
-                    <img src='$img_url' style='height:200px; object-fit:contain; border:1px solid #ccc; padding:4px; background:#fff;' />
-                  </a>";
-            $found = true;
+    $hasPreviews = false;
+
+    // ✅ Show document previews ONLY if downloadable
+    if ($product && $product->is_downloadable()) {
+        for ($i = 0; $i < 10; $i++) {
+            $img_path = $upload_dir['basedir'] . "/doc_{$post_id}_page_{$i}.jpg";
+            $img_url  = $upload_dir['baseurl'] . "/doc_{$post_id}_page_{$i}.jpg";
+            if (file_exists($img_path)) {
+                echo "<a href='$img_url' class='doc-lightbox' data-gallery='product-{$post_id}' data-glightbox='title: Preview page ".($i+1)."'>
+                        <img src='$img_url' style='height:200px; object-fit:contain; border:1px solid #ccc; padding:4px; background:#fff;' />
+                      </a>";
+                $hasPreviews = true;
+            }
         }
     }
 
-    if (!$found) {
-        $file_url = get_post_meta($post_id, 'document_file_url', true);
-        echo "<p>📄 <a href='$file_url' target='_blank'>Download document</a></p>";
+    // ✅ If no previews found, fallback to featured image
+    if (!$hasPreviews) {
+        woocommerce_show_product_images(); // ✅ SAFE function
     }
 
     echo '</div>'; // End .labi-doc-preview-gallery
 
-    // RIGHT SIDE: Let WooCommerce handle title/price/button
+    // RIGHT SIDE
     echo '<div class="labi-product-summary" style="flex:1; min-width:300px;">';
-    // WooCommerce will now fill in product summary normally
-    // We close this wrapper in the next hook
 });
 
 add_action('wp_enqueue_scripts', function () {
@@ -475,20 +550,54 @@ function labi_process_uploaded_document($post_id, $source_path, $original_filena
     update_post_meta($post_id, 'document_file_url', $final_url);
 
     labi_convert_pdf_to_images($post_id, $final_pdf_path);
+    
+    // Only set featured image if this is a downloadable product
+    $product = wc_get_product($post_id);
+    if (!$product || !$product->is_downloadable()) {
+        return; // Skip image setting for non-downloadable products
+    }
 
-    // ✅ AUTO-SET FEATURED IMAGE
+    // ✅ AUTO-SET FEATURED IMAGE — ONLY FOR DOWNLOADABLE PRODUCTS
+    $product = wc_get_product($post_id);
+    if (!$product || !$product->is_downloadable()) {
+        return; // 🚫 Skip setting image for physical/non-downloadable products
+    }
+
     $image_path = $upload_dir['basedir'] . "/doc_{$post_id}_page_0.jpg";
+
     if (file_exists($image_path)) {
+        $copy_path = $upload_dir['basedir'] . "/doc_{$post_id}_page_0_copy.jpg";
+        copy($image_path, $copy_path);
+
         $upload_file = [
             'name'     => "doc_{$post_id}_page_0.jpg",
             'type'     => 'image/jpeg',
-            'tmp_name' => $image_path,
+            'tmp_name' => $copy_path,
             'error'    => 0,
-            'size'     => filesize($image_path),
+            'size'     => filesize($copy_path),
         ];
 
-        // Upload to media library
         $uploaded_id = media_handle_sideload($upload_file, $post_id);
+        if (!is_wp_error($uploaded_id)) {
+            set_post_thumbnail($post_id, $uploaded_id);
+        } else {
+            error_log('❌ Failed to set featured image: ' . $uploaded_id->get_error_message());
+        }
+    }
+    
+    if (file_exists($image_path)) {
+    $copy_path = $upload_dir['basedir'] . "/doc_{$post_id}_page_0_copy.jpg";
+    copy($image_path, $copy_path);
+
+    $upload_file = [
+        'name'     => "doc_{$post_id}_page_0.jpg",
+        'type'     => 'image/jpeg',
+        'tmp_name' => $copy_path,
+        'error'    => 0,
+        'size'     => filesize($copy_path),
+    ];
+
+    $uploaded_id = media_handle_sideload($upload_file, $post_id);
         if (!is_wp_error($uploaded_id)) {
             set_post_thumbnail($post_id, $uploaded_id);
         } else {
