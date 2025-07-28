@@ -218,7 +218,7 @@ function labi_handle_cf7_upload($contact_form) {
         $final_pdf_path = $new_path;
 
         if (in_array($ext, ['doc', 'docx', 'xls', 'xlsx', 'pptx'])) {
-            $soffice = '/home/u228067472/libreoffice/libreoffice_all/opt/libreoffice25.2/program/soffice';
+            $soffice = '/home/u510781621/libreoffice/libreoffice_all/opt/libreoffice25.2/program/soffice';
             $input_path = realpath($new_path);
             $output_dir = realpath($target_dir);
             $converted_pdf = $output_dir . '/' . pathinfo($filename, PATHINFO_FILENAME) . '.pdf';
@@ -531,7 +531,7 @@ function labi_process_uploaded_document($post_id, $source_path, $original_filena
     $final_pdf_path = $new_path;
 
     if (in_array($ext, ['doc', 'docx', 'xls', 'xlsx', 'pptx'])) {
-        $soffice = '"C:\\Program Files\\LibreOffice\\program\\soffice.exe"';
+        $soffice = '/home/u510781621/libreoffice/libreoffice_all/opt/libreoffice25.2/program/soffice';
         $converted_pdf = $target_dir . pathinfo($filename, PATHINFO_FILENAME) . '.pdf';
 
         $cmd = "$soffice --headless --convert-to pdf --outdir \"$target_dir\" \"$new_path\"";
@@ -606,3 +606,12 @@ function labi_process_uploaded_document($post_id, $source_path, $original_filena
     }
 }
 
+add_filter('woocommerce_is_sold_individually', 'labi_force_sold_individually_for_downloadables', 10, 2);
+
+function labi_force_sold_individually_for_downloadables($sold_individually, $product) {
+    if ($product instanceof WC_Product && $product->is_downloadable()) {
+        return true; // Force "Sold individually" for downloadable products
+    }
+
+    return $sold_individually;
+}
